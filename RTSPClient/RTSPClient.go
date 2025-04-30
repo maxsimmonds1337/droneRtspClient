@@ -24,6 +24,9 @@ type Info struct {
 	ffmpegCmd    *exec.Cmd
 	ffmpegIn     io.WriteCloser
 	Logger       *log.Logger
+	currentFU    []byte
+	sps          []byte
+	pps          []byte
 }
 
 type RtspResponse struct {
@@ -166,7 +169,7 @@ func (c *Info) Play() (RtspResponse, error) {
 	if err != nil {
 		return RtspResponse{}, err
 	}
-	return c.getResponse()
+	return RtspResponse{}, nil //c.getResponse()
 }
 
 func (c *Info) getResponse() (RtspResponse, error) {
@@ -278,6 +281,7 @@ func (c *Info) ReadRtpPacketAndStreamToFFmpeg() {
 			return
 		}
 
+		// make this a function so I can test it
 		// If it's not an RTP packet, skip it and continue reading
 		if buf[0] != '$' {
 			c.Logger.Printf("Not an RTP packet")
@@ -295,19 +299,114 @@ func (c *Info) ReadRtpPacketAndStreamToFFmpeg() {
 			log.Fatalf("Read payload error: %v", err)
 		}
 
-		c.Logger.Printf("Received RTP packet on channel %d with length %d bytes", channel, length)
+		switch channel {
+		case 0:
+			// RTP media packet
+			if len(payload) <= 12 {
+				c.Logger.Printf("Payload too short for RTP: %d bytes", len(payload))
+				continue
+			}
+			rtpPayload := payload[12:]
+			c.handleRTPPayload(rtpPayload)
 
-		// If it's RTP data (channel 0), pipe it to FFmpeg
-		if channel == 0 {
-			// Write the RTP payload to FFmpeg's input pipe
+		case 1:
+			// RTCP packet — ignore it silently, it's normal
+			continue
 
-			mediaPayload := payload[12:] // <-- strip off the first 12 bytes
-			_, err := c.ffmpegIn.Write(mediaPayload)
-			if err != nil {
-				log.Printf("Error writing RTP data to FFmpeg: %s", err)
+		default:
+			c.Logger.Printf("Unknown channel: %d, ignoring", channel)
+			continue
+		}
+	}
+}
+
+const startCode = "\x00\x00\x00\x01"
+
+func (c *Info) handleRTPPayload(payload []byte) {
+	if len(payload) < 1 {
+		return
+	}
+
+	nalType := payload[0] & 0x1F
+	c.Logger.Printf("Nal type: %d", nalType)
+
+	switch nalType {
+	case 7: // SPS
+		c.sps = make([]byte, len(startCode)+len(payload))
+		copy(c.sps, startCode)
+		copy(c.sps[len(startCode):], payload)
+		c.Logger.Println("SPS: " + string(c.sps))
+	case 8: // PPS
+		c.pps = make([]byte, len(startCode)+len(payload))
+		copy(c.pps, startCode)
+		copy(c.pps[len(startCode):], payload)
+		c.Logger.Println("PPS: " + string(c.pps))
+	case 5: // IDR (keyframe)
+		if len(c.sps) == 0 {
+			c.Logger.Print("Orphaned frame, dropping")
+			return
+		}
+		c.saveNAL(c.sps)
+		c.saveNAL(c.pps)
+		c.saveNAL([]byte(startCode))
+		c.saveNAL(payload)
+	case 1, 6: // Non-IDR slice or SEI
+		c.saveNAL(c.sps)
+		c.saveNAL(c.pps)
+		c.saveNAL([]byte(startCode))
+		c.saveNAL(payload)
+	case 28: // FU-A
+
+		if len(payload) < 2 {
+			return
+		}
+		fuIndicator := payload[0]
+		fuHeader := payload[1]
+		start := (fuHeader & 0x80) != 0
+		end := (fuHeader & 0x40) != 0
+		reconstructedNALType := fuHeader & 0x1F
+		nalHeader := (fuIndicator & 0xE0) | reconstructedNALType
+
+		if start {
+
+			c.currentFU = []byte{nalHeader}
+			c.currentFU = append(c.currentFU, payload[2:]...)
+		} else if c.currentFU != nil {
+			c.currentFU = append(c.currentFU, payload[2:]...)
+		} else {
+			c.Logger.Println("Orphaned FU-A fragment, dropping")
+			return
+		}
+
+		if end {
+			if len(c.sps) == 0 || len(c.pps) == 0 {
+				c.Logger.Print("Orphaned FU-A end fragment without SPS/PPS, dropping")
+				c.currentFU = nil
 				return
 			}
+
+			if (c.currentFU[0] & 0x1F) == 5 { // IDR
+				c.Logger.Println("FU-A completed: IDR slice, injecting SPS/PPS")
+				c.saveNAL(c.sps)
+				c.saveNAL(c.pps)
+			}
+
+			c.saveNAL([]byte(startCode))
+			c.saveNAL(c.currentFU)
+			c.currentFU = nil
 		}
+	default:
+		// Just ignore
+	}
+}
+
+func (c *Info) saveNAL(nal []byte) {
+
+	// Write the RTP payload to FFmpeg's input pipe
+	_, err := c.ffmpegIn.Write(nal)
+	if err != nil {
+		log.Printf("Error writing RTP data to FFmpeg: %s", err)
+		return
 	}
 }
 
@@ -327,6 +426,7 @@ func (c *Info) Close() error {
 		}
 	}
 
-	c.Conn.Close()
+	//TODO: wrap this
+	err = c.Conn.Close()
 	return err
 }

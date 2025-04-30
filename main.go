@@ -1,7 +1,7 @@
 package main
 
 import (
-	"dronehack/RTSPClient"
+	"droneRtspClient/RTSPClient"
 	"log"
 	"os"
 	"os/signal"
