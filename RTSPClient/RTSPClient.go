@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -272,25 +273,29 @@ func (c *Info) ReadRtpPacketAndStreamToFFmpeg() {
 	defer c.ffmpegIn.Close()
 
 	// Start reading RTP packets and piping them to FFmpeg
+	buf := make([]byte, 1)
 	for {
 		// Buffer for the RTP packet
-		buf := make([]byte, 4)
 		_, err := io.ReadFull(c.Conn, buf)
 		if err != nil {
 			c.Logger.Printf("Error reading RTP packet header: %s", err)
 			return
 		}
 
-		// make this a function so I can test it
 		// If it's not an RTP packet, skip it and continue reading
 		if buf[0] != '$' {
 			c.Logger.Printf("Not an RTP packet")
 			continue
 		}
 
+		header := make([]byte, 3)
 		// Channel and payload length
-		channel := buf[1]
-		length := int(buf[2])<<8 | int(buf[3])
+		_, err = io.ReadFull(c.Conn, header)
+		if err != nil {
+			return
+		}
+		channel := header[0]
+		length := int(header[1])<<8 | int(header[2])
 
 		// Allocate buffer for payload data
 		payload := make([]byte, length)
@@ -306,7 +311,12 @@ func (c *Info) ReadRtpPacketAndStreamToFFmpeg() {
 				c.Logger.Printf("Payload too short for RTP: %d bytes", len(payload))
 				continue
 			}
-			rtpPayload := payload[12:]
+			rtpHeaderLen := 12 + int(payload[0]&0x0F)*4 // base header + CSRC list
+			if len(payload) < rtpHeaderLen {
+				c.Logger.Printf("RTP header length exceeds payload size")
+				continue
+			}
+			rtpPayload := payload[rtpHeaderLen:]
 			c.handleRTPPayload(rtpPayload)
 
 		case 1:
@@ -320,7 +330,7 @@ func (c *Info) ReadRtpPacketAndStreamToFFmpeg() {
 	}
 }
 
-const startCode = "\x00\x00\x00\x01"
+var startCode = []byte{0x00, 0x00, 0x00, 0x01}
 
 func (c *Info) handleRTPPayload(payload []byte) {
 	if len(payload) < 1 {
@@ -332,15 +342,19 @@ func (c *Info) handleRTPPayload(payload []byte) {
 
 	switch nalType {
 	case 7: // SPS
-		c.sps = make([]byte, len(startCode)+len(payload))
-		copy(c.sps, startCode)
-		copy(c.sps[len(startCode):], payload)
-		c.Logger.Println("SPS: " + string(c.sps))
+		if len(c.sps) == 0 {
+			c.sps = make([]byte, len(startCode)+len(payload))
+			copy(c.sps, startCode)
+			copy(c.sps[len(startCode):], payload)
+		}
+		c.Logger.Printf("SPS: %x", c.sps)
 	case 8: // PPS
-		c.pps = make([]byte, len(startCode)+len(payload))
-		copy(c.pps, startCode)
-		copy(c.pps[len(startCode):], payload)
-		c.Logger.Println("PPS: " + string(c.pps))
+		if len(c.pps) == 0 {
+			c.pps = make([]byte, len(startCode)+len(payload))
+			copy(c.pps, startCode)
+			copy(c.pps[len(startCode):], payload)
+		}
+		c.Logger.Printf("PPS: %x", c.pps)
 	case 5: // IDR (keyframe)
 		if len(c.sps) == 0 {
 			c.Logger.Print("Orphaned frame, dropping")
@@ -360,6 +374,7 @@ func (c *Info) handleRTPPayload(payload []byte) {
 		if len(payload) < 2 {
 			return
 		}
+
 		fuIndicator := payload[0]
 		fuHeader := payload[1]
 		start := (fuHeader & 0x80) != 0
@@ -368,7 +383,6 @@ func (c *Info) handleRTPPayload(payload []byte) {
 		nalHeader := (fuIndicator & 0xE0) | reconstructedNALType
 
 		if start {
-
 			c.currentFU = []byte{nalHeader}
 			c.currentFU = append(c.currentFU, payload[2:]...)
 		} else if c.currentFU != nil {
@@ -387,6 +401,7 @@ func (c *Info) handleRTPPayload(payload []byte) {
 
 			if (c.currentFU[0] & 0x1F) == 5 { // IDR
 				c.Logger.Println("FU-A completed: IDR slice, injecting SPS/PPS")
+				c.Logger.Printf("SPS:%s\nPPS:%s", c.sps, c.pps)
 				c.saveNAL(c.sps)
 				c.saveNAL(c.pps)
 			}
@@ -400,15 +415,51 @@ func (c *Info) handleRTPPayload(payload []byte) {
 	}
 }
 
-func (c *Info) saveNAL(nal []byte) {
+func (c *Info) findFirstDollarSign() bool {
 
-	// Write the RTP payload to FFmpeg's input pipe
-	_, err := c.ffmpegIn.Write(nal)
+	for {
+		b := make([]byte, 1)
+		_, err := io.ReadFull(c.Conn, b)
+
+		if err != nil {
+			c.Logger.Printf("error reading from stream")
+			return false
+		}
+
+		if string(b[0]) == "$" {
+			return true
+		}
+	}
+
+}
+
+func (c *Info) saveNAL(nal []byte) {
+	file, err := os.OpenFile("output.h264", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Printf("Error writing RTP data to FFmpeg: %s", err)
+		log.Printf("Error opening file for appending: %s", err)
 		return
 	}
+	defer file.Close()
+
+	_, err = file.Write(nal)
+	if err != nil {
+		log.Printf("Error writing to file: %s", err)
+	}
 }
+
+// func (c *Info) saveNAL(nal []byte) {
+//
+// 	// Write the RTP payload to FFmpeg's input pipe
+// 	err := os.WriteFile("output.h264", nal, 0644)
+// 	if err != nil {
+// 		log.Printf("Error writing to file: %s", err)
+// 	}
+// 	// _, err = c.ffmpegIn.Write(nal)
+// 	// if err != nil {
+// 	// 	log.Printf("Error writing RTP data to FFmpeg: %s", err)
+// 	// 	return
+// 	// }
+// }
 
 func (c *Info) Close() error {
 	var err error
